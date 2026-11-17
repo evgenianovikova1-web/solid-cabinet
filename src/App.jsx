@@ -9,7 +9,7 @@ const SCRIPT_URL =
 
 // Код клиента берётся из адреса страницы: ?token=КОД. Если его нет — используется код по умолчанию.
 // Коды лежат в листе «_Клиенты», колонка C.
-const DEFAULT_COMPANY = 'Пенотерм';
+
 const DEFAULT_TOKEN = '5de8cc34cafa4f08b469bc46391858dc';
 
 const POLL_MS = 12000;
@@ -107,8 +107,6 @@ const errText = (c) => ERR_TEXT[c] || 'Не удалось выполнить з
 export default function App() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const token = (params.get('token') || DEFAULT_TOKEN).trim();
-  const companyTitle = params.get('company') || DEFAULT_COMPANY;
-
   const [portal, setPortal] = useState(null); // { vacancies, meetings }
   const [analytics, setAnalytics] = useState(null);
   const [portalErr, setPortalErr] = useState('');
@@ -290,7 +288,7 @@ export default function App() {
       <section className="bg-[#035A07] text-white">
         <div className="max-w-5xl mx-auto px-5 sm:px-8 py-12">
           <p className="text-[11px] uppercase tracking-[0.2em] opacity-80">Кабинет заказчика</p>
-          <h1 className="text-3xl sm:text-5xl font-light mt-3">{companyTitle}</h1>
+          <h1 className="text-3xl sm:text-5xl font-light mt-3">{portal?.company || 'Загрузка…'}</h1>
           <p className="text-sm opacity-80 mt-4">
             {portal
               ? `Обновлено: ${vacancies[0]?.updated || '—'}`
@@ -324,7 +322,7 @@ export default function App() {
               onChange={(e) => setSelectedVacancy(e.target.value)}
               className="appearance-none bg-[#F6F7F8] border border-[#B8C2BB] text-sm pl-4 pr-9 py-2.5 outline-none cursor-pointer"
             >
-              <option value="__all__">Все вакансии ({companyTitle})</option>
+              <h1 className="text-3xl sm:text-5xl font-light mt-3">{portal?.company || 'Загрузка…'}</h1>
               {vacancyNames.map((n) => <option key={n} value={n}>{n}</option>)}
             </select>
             <ChevronDown className="w-4 h-4 text-[#6B6F6E] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
