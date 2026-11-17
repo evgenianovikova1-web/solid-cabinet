@@ -1,1423 +1,630 @@
-import React, { useState, useMemo, useEffect } from 'react';
-import {
-  RefreshCw,
-  ArrowUpRight,
-  Clock,
-  SlidersHorizontal,
-  Check,
-  ChevronDown,
-  Link2,
-  Info,
-  Sparkles,
-} from 'lucide-react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import { RefreshCw, ChevronDown, Send, AlertTriangle } from 'lucide-react';
 
 // ============================================================================
-// НОРМАЛИЗАЦИЯ ПРИЧИН ОТКАЗОВ
-// Объединяет «Недостаточная оплата», «Не устроила ЗП» и аналоги в «Зарплатные ожидания»
+// НАСТРОЙКИ ПОДКЛЮЧЕНИЯ К GOOGLE ТАБЛИЦЕ (через Apps Script)
 // ============================================================================
-const REASON_ALIASES = {
-  'недостаточная оплата': 'Зарплатные ожидания',
-  'недостаточно оплаты': 'Зарплатные ожидания',
-  'не устроила зп': 'Зарплатные ожидания',
-  'не сошлись по зп': 'Зарплатные ожидания',
-  'финансовые ожидания': 'Зарплатные ожидания',
-  'высокие зарплатные ожидания': 'Зарплатные ожидания',
-  'зарплата': 'Зарплатные ожидания',
-  'зп': 'Зарплатные ожидания',
-  'зарплатные ожидания': 'Зарплатные ожидания',
-  'недостаточно опыта': 'Недостаточно опыта',
-  'мало опыта': 'Недостаточно опыта',
-  'отказ кандидата': 'Отказ кандидата',
-  'кандидат отказался': 'Отказ кандидата',
-  'принял другой оффер': 'Отказ кандидата',
-  'отклонен заказчиком': 'Отклонен заказчиком',
-  'отказ клиента': 'Отклонен заказчиком',
-  'не выходит на связь': 'Не выходит на связь',
-  'недозвон': 'Не выходит на связь',
-  'локация / график': 'Локация / график',
-  'локация': 'Локация / график',
-  'график работы': 'Локация / график',
-};
+const SCRIPT_URL =
+  'https://script.google.com/macros/s/AKfycbyOSBTr2H0F862FZgfFLN3LWak_tAYRormltHBjot3I02Rr0ztIM6TfSXwPSjMEep8/exec';
 
-function normalizeReasonKey(rawKey) {
-  const clean = String(rawKey || '').trim();
+// Код клиента берётся из адреса страницы: ?token=КОД. Если его нет — используется код по умолчанию.
+// Коды лежат в листе «_Клиенты», колонка C.
+const DEFAULT_COMPANY = 'Пенотерм';
+const DEFAULT_TOKEN = '5de8cc34cafa4f08b469bc46391858dc';
+
+const POLL_MS = 12000;
+
+// ============================================================================
+// JSONP: единственный способ, который стабильно работает с Apps Script из браузера (без CORS)
+// ============================================================================
+function jsonp(params, timeoutMs = 45000) {
+  return new Promise((resolve) => {
+    const cb = 'solid_cb_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+    const s = document.createElement('script');
+    let done = false;
+    let timer = null;
+    const end = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { delete window[cb]; } catch (e) { window[cb] = undefined; }
+      if (s.parentNode) s.parentNode.removeChild(s);
+      resolve(r);
+    };
+    timer = setTimeout(() => end({ ok: false, error: 'network' }), timeoutMs);
+    window[cb] = end;
+    s.onerror = () => end({ ok: false, error: 'network' });
+    const q = Object.keys(params)
+      .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
+      .join('&');
+    s.src = `${SCRIPT_URL}?client=1&${q}&callback=${cb}&_t=${Date.now()}`;
+    document.body.appendChild(s);
+  });
+}
+
+// ============================================================================
+// ПРИЧИНЫ ОТКАЗОВ: на случай старых названий в данных
+// ============================================================================
+function normalizeReasonKey(raw) {
+  const clean = String(raw || '').trim();
   if (!clean) return 'Другое';
-  const lower = clean.toLowerCase();
-  if (REASON_ALIASES[lower]) return REASON_ALIASES[lower];
-  if (
-    lower.includes('оплат') ||
-    lower.includes('зарплат') ||
-    lower.includes('зп') ||
-    lower.includes('ожидан') ||
-    lower.includes('деньг')
-  ) {
-    return 'Зарплатные ожидания';
-  }
-  if (lower.includes('опыт') || lower.includes('квалифик')) {
-    return 'Недостаточно опыта';
-  }
-  if (lower.includes('локац') || lower.includes('график') || lower.includes('удален')) {
-    return 'Локация / график';
-  }
-  if (lower.includes('связ') || lower.includes('недозвон') || lower.includes('пропал')) {
-    return 'Не выходит на связь';
-  }
+  const l = clean.toLowerCase();
+  if (/зарплат|оплат|бюджет|\bзп\b/.test(l)) return 'Зарплатные ожидания';
+  if (/опыт/.test(l)) return 'Недостаточно опыта';
+  if (/соискател|кандидат|кондидат/.test(l)) return 'Отказ кандидата';
+  if (/локац|удален|график/.test(l)) return 'Локация / график';
+  if (/не выходит|связ|недозвон/.test(l)) return 'Не выходит на связь';
+  if (/заказчик/.test(l)) return 'Отклонен заказчиком';
   return clean;
 }
 
-function mergeRejectReasons(reasonsObj = {}) {
-  const merged = {};
-  Object.entries(reasonsObj).forEach(([key, count]) => {
-    const val = Number(count) || 0;
-    if (val <= 0) return;
-    const norm = normalizeReasonKey(key);
-    merged[norm] = (merged[norm] || 0) + val;
+function mergeReasons(obj = {}) {
+  const out = {};
+  Object.entries(obj).forEach(([k, v]) => {
+    const n = Number(v) || 0;
+    if (n <= 0) return;
+    const key = normalizeReasonKey(k);
+    out[key] = (out[key] || 0) + n;
   });
-  return merged;
+  return Object.entries(out).sort((a, b) => b[1] - a[1]);
 }
 
-// ============================================================================
-// ДЕМО-ДАННЫЕ КАНДИДАТОВ И АНАЛИТИКИ (соответствуют формату getAnalytics_ из Analytics.gs)
-// ============================================================================
-const INITIAL_CANDIDATES = [
-  {
-    id: 1,
-    name: 'Алексей Смирнов',
-    vacancy: 'Старший дизайнер продукции',
-    role: 'Senior Product Designer',
-    experience: '7 лет',
-    salary: '280 000 ₽',
-    location: 'Москва (удаленно / гибрид)',
-    status: 'action_required',
-    daysWaiting: 3,
-    addedDate: '11.11.2026',
-    solidSummary:
-      'Опыт в fintech и SaaS-продуктах. Системный подход к дизайн-системам, сильная продуктовая аналитика и защита решений на языке метрик.',
-    tags: ['Figma', 'Design Systems', 'UX Research', 'Fintech'],
-    cvUrl: '#cv-1',
-  },
-  {
-    id: 2,
-    name: 'Мария Кузнецова',
-    vacancy: 'Старший дизайнер продукции',
-    role: 'Senior Product Designer',
-    experience: '5 лет',
-    salary: '250 000 ₽',
-    location: 'Санкт-Петербург',
-    status: 'interview_scheduled',
-    daysWaiting: 1,
-    addedDate: '08.11.2026',
-    interviewTime: 'Завтра, 17 ноября в 15:00',
-    solidSummary:
-      'Сильный визуал и опыт проектирования сложных B2B-дашбордов. Успешно защитила продуктовый кейс на техническом скрининге.',
-    tags: ['B2B SaaS', 'Figma', 'Web & Mobile', 'Prototyping'],
-    cvUrl: '#cv-2',
-  },
-  {
-    id: 3,
-    name: 'Дмитрий Волков',
-    vacancy: 'Старший дизайнер продукции',
-    role: 'Lead / Senior Product Designer',
-    experience: '6 лет',
-    salary: '270 000 ₽',
-    location: 'Москва (гибрид)',
-    status: 'action_required',
-    daysWaiting: 2,
-    addedDate: '13.11.2026',
-    solidSummary:
-      'Вел редизайн клиентского портала в крупном e-commerce (+18% к конверсии чекаута). Самостоятельно проводит глубинные интервью.',
-    tags: ['E-commerce', 'CJM', 'JTBD', 'Design Tokens'],
-    cvUrl: '#cv-3',
-  },
-  {
-    id: 4,
-    name: 'Екатерина Орлова',
-    vacancy: 'Руководитель отдела продаж',
-    role: 'Head of B2B Sales',
-    experience: '8 лет',
-    salary: '320 000 ₽',
-    location: 'Москва (офис)',
-    status: 'interview_requested',
-    daysWaiting: 1,
-    addedDate: '05.11.2026',
-    solidSummary:
-      'Построила отдел корпоративных продаж с нуля до 14 человек. Выполнение годового плана 116%, опыт внедрения CRM и воронки.',
-    tags: ['B2B Sales', 'Управленческий учет', 'amoCRM', 'Enterprise'],
-    cvUrl: '#cv-4',
-  },
-];
-
-// Пресеты аналитики в точном формате ответа getAnalytics_() из Google Apps Script
-const ANALYTICS_PRESETS = {
-  penoterm: {
-    companyTitle: 'Пенотерм',
-    recruiter: 'Надежда',
-    heroVacancy: 'Производственный и коммерческий подбор',
-    deadlineNote: 'Активно 4 вакансии · Обновление из таблицы в реальном времени',
-    analytics: {
-      generated: '16.11.2026 11:38',
-      journalSince: '26.10.2026',
-      journalDays: 21,
-      overall: {
-        vacancy: 'Все вакансии компании (Пенотерм)',
-        since: '28.09.2026',
-        daysOpen: 49,
-        total: 439,
-        active: 50,
-        rejected: 389,
-        presented: 12,
-        offers: 2,
-        hired: 1,
-        funnel: [
-          { stage: 'Отобрано по резюме', count: 439, conv: null },
-          { stage: 'На оценке', count: 29, conv: 7 },
-          { stage: 'На согласовании у клиента', count: 12, conv: 41 },
-          { stage: 'Интервью с клиентом', count: 6, conv: 50 },
-          { stage: 'Решение по кандидату', count: 3, conv: 50 },
-          { stage: 'Оффер', count: 2, conv: 67 },
-          { stage: 'Вышел на работу', count: 1, conv: 50 },
-        ],
-        waitingNow: { count: 1, avgDays: 3 },
-        // Включаем «Недостаточная оплата» специально, чтобы показать автоматическое слияние с «Зарплатные ожидания»
-        reasons: {
-          'Отказ кандидата': 197,
-          'Зарплатные ожидания': 72,
-          'Недостаточная оплата': 15,
-          'Недостаточно опыта': 43,
-          'Другое': 25,
-          'Отклонен заказчиком': 22,
-          'Не выходит на связь': 12,
-          'Локация / график': 3,
-        },
-        weekly: {
-          labels: ['28.09', '05.10', '12.10', '19.10', '26.10', '02.11', '09.11', '16.11'],
-          added: [34, 48, 62, 58, 74, 83, 40, 40],
-          presented: [1, 1, 2, 2, 2, 2, 1, 1],
-        },
-        offerDays: { count: 2, median: 18.5 },
-        waitDone: { count: 9, avg: 2.6 },
-      },
-      vacancies: [
-        {
-          vacancy: 'Инженер-технолог полимерного производства',
-          since: '28.09.2026',
-          daysOpen: 49,
-          total: 184,
-          active: 19,
-          rejected: 165,
-          presented: 5,
-          offers: 1,
-          hired: 1,
-          funnel: [
-            { stage: 'Отобрано по резюме', count: 184, conv: null },
-            { stage: 'На оценке', count: 14, conv: 8 },
-            { stage: 'На согласовании у клиента', count: 5, conv: 36 },
-            { stage: 'Интервью с клиентом', count: 3, conv: 60 },
-            { stage: 'Решение по кандидату', count: 2, conv: 67 },
-            { stage: 'Оффер', count: 1, conv: 50 },
-            { stage: 'Вышел на работу', count: 1, conv: 100 },
-          ],
-          waitingNow: { count: 1, avgDays: 3 },
-          reasons: {
-            'Отказ кандидата': 82,
-            'Зарплатные ожидания': 34,
-            'Недостаточная оплата': 8,
-            'Недостаточно опыта': 21,
-            'Другое': 10,
-            'Отклонен заказчиком': 7,
-            'Не выходит на связь': 3,
-          },
-          weekly: {
-            labels: ['28.09', '05.10', '12.10', '19.10', '26.10', '02.11', '09.11', '16.11'],
-            added: [18, 22, 29, 24, 31, 28, 16, 16],
-            presented: [0, 1, 1, 1, 1, 0, 1, 0],
-          },
-          offerDays: { count: 3, median: 21.0 },
-          waitDone: { count: 5, avg: 2.8 },
-        },
-        {
-          vacancy: 'Региональный менеджер по B2B-продажам',
-          since: '12.10.2026',
-          daysOpen: 35,
-          total: 255,
-          active: 31,
-          rejected: 224,
-          presented: 7,
-          offers: 1,
-          hired: 0,
-          funnel: [
-            { stage: 'Отобрано по резюме', count: 255, conv: null },
-            { stage: 'На оценке', count: 15, conv: 6 },
-            { stage: 'На согласовании у клиента', count: 7, conv: 47 },
-            { stage: 'Интервью с клиентом', count: 3, conv: 43 },
-            { stage: 'Решение по кандидату', count: 1, conv: 33 },
-            { stage: 'Оффер', count: 1, conv: 100 },
-            { stage: 'Вышел на работу', count: 0, conv: 0 },
-          ],
-          waitingNow: { count: 0, avgDays: null },
-          reasons: {
-            'Отказ кандидата': 115,
-            'Зарплатные ожидания': 38,
-            'Недостаточная оплата': 7,
-            'Недостаточно опыта': 22,
-            'Другое': 15,
-            'Отклонен заказчиком': 15,
-            'Не выходит на связь': 9,
-            'Локация / график': 3,
-          },
-          weekly: {
-            labels: ['28.09', '05.10', '12.10', '19.10', '26.10', '02.11', '09.11', '16.11'],
-            added: [16, 26, 33, 34, 43, 55, 24, 24],
-            presented: [1, 0, 1, 1, 1, 2, 0, 1],
-          },
-          offerDays: { count: 1, median: 16.0 },
-          waitDone: { count: 4, avg: 2.3 },
-        },
-      ],
-    },
-  },
-  dom_dereva: {
-    companyTitle: 'Дом Дерева',
-    recruiter: 'Надежда',
-    heroVacancy: 'Старший дизайнер продукции',
-    deadlineNote: 'Рекрутер: Надежда · Выход финалиста до 28 ноября',
-    analytics: {
-      generated: '16.11.2026 11:45',
-      journalSince: '26.10.2026',
-      journalDays: 21,
-      overall: {
-        vacancy: 'Все вакансии компании (Дом Дерева)',
-        since: '05.10.2026',
-        daysOpen: 42,
-        total: 146,
-        active: 18,
-        rejected: 128,
-        presented: 9,
-        offers: 1,
-        hired: 0,
-        funnel: [
-          { stage: 'Отобрано по резюме', count: 146, conv: null },
-          { stage: 'На оценке', count: 24, conv: 16 },
-          { stage: 'На согласовании у клиента', count: 9, conv: 38 },
-          { stage: 'Интервью с клиентом', count: 5, conv: 56 },
-          { stage: 'Решение по кандидату', count: 2, conv: 40 },
-          { stage: 'Оффер', count: 1, conv: 50 },
-          { stage: 'Вышел на работу', count: 0, conv: 0 },
-        ],
-        waitingNow: { count: 2, avgDays: 2.5 },
-        reasons: {
-          'Отказ кандидата': 54,
-          'Зарплатные ожидания': 29,
-          'Недостаточная оплата': 9,
-          'Недостаточно опыта': 19,
-          'Отклонен заказчиком': 9,
-          'Другое': 5,
-          'Локация / график': 3,
-        },
-        weekly: {
-          labels: ['28.09', '05.10', '12.10', '19.10', '26.10', '02.11', '09.11', '16.11'],
-          added: [0, 14, 22, 26, 24, 28, 19, 13],
-          presented: [0, 1, 1, 2, 1, 2, 1, 1],
-        },
-        offerDays: { count: 3, median: 17.5 },
-        waitDone: { count: 7, avg: 1.9 },
-      },
-      vacancies: [
-        {
-          vacancy: 'Старший дизайнер продукции',
-          since: '05.10.2026',
-          daysOpen: 42,
-          total: 94,
-          active: 11,
-          rejected: 83,
-          presented: 6,
-          offers: 1,
-          hired: 0,
-          funnel: [
-            { stage: 'Отобрано по резюме', count: 94, conv: null },
-            { stage: 'На оценке', count: 16, conv: 17 },
-            { stage: 'На согласовании у клиента', count: 6, conv: 38 },
-            { stage: 'Интервью с клиентом', count: 4, conv: 67 },
-            { stage: 'Решение по кандидату', count: 2, conv: 50 },
-            { stage: 'Оффер', count: 1, conv: 50 },
-            { stage: 'Вышел на работу', count: 0, conv: 0 },
-          ],
-          waitingNow: { count: 2, avgDays: 2.5 },
-          reasons: {
-            'Отказ кандидата': 36,
-            'Зарплатные ожидания': 24,
-            'Недостаточно опыта': 13,
-            'Отклонен заказчиком': 6,
-            'Другое': 4,
-          },
-          weekly: {
-            labels: ['28.09', '05.10', '12.10', '19.10', '26.10', '02.11', '09.11', '16.11'],
-            added: [0, 14, 16, 15, 14, 15, 12, 8],
-            presented: [0, 1, 1, 1, 1, 1, 1, 0],
-          },
-          offerDays: { count: 3, median: 17.5 },
-          waitDone: { count: 5, avg: 1.8 },
-        },
-        {
-          vacancy: 'Руководитель отдела продаж',
-          since: '19.10.2026',
-          daysOpen: 28,
-          total: 52,
-          active: 7,
-          rejected: 45,
-          presented: 3,
-          offers: 0,
-          hired: 0,
-          funnel: [
-            { stage: 'Отобрано по резюме', count: 52, conv: null },
-            { stage: 'На оценке', count: 8, conv: 15 },
-            { stage: 'На согласовании у клиента', count: 3, conv: 38 },
-            { stage: 'Интервью с клиентом', count: 1, conv: 33 },
-            { stage: 'Решение по кандидату', count: 0, conv: 0 },
-            { stage: 'Оффер', count: 0, conv: null },
-            { stage: 'Вышел на работу', count: 0, conv: null },
-          ],
-          waitingNow: { count: 0, avgDays: null },
-          reasons: {
-            'Отказ кандидата': 18,
-            'Зарплатные ожидания': 14,
-            'Недостаточно опыта': 6,
-            'Отклонен заказчиком': 3,
-            'Локация / график': 3,
-            'Другое': 1,
-          },
-          weekly: {
-            labels: ['28.09', '05.10', '12.10', '19.10', '26.10', '02.11', '09.11', '16.11'],
-            added: [0, 0, 6, 11, 10, 13, 7, 5],
-            presented: [0, 0, 0, 1, 0, 1, 0, 1],
-          },
-          offerDays: { count: 0, median: null },
-          waitDone: { count: 2, avg: 2.1 },
-        },
-      ],
-    },
-  },
-};
-
-const STATUS = {
-  action_required: { label: 'Ждём вашего решения', dot: 'bg-[#D9962B]', color: 'text-[#8A5A14]' },
-  interview_requested: { label: 'Согласуем время', dot: 'bg-[#0E8C7F]', color: 'text-[#0E8C7F]' },
-  interview_scheduled: { label: 'Встреча назначена', dot: 'bg-[#035A07]', color: 'text-[#035A07]' },
-  rejected: { label: 'Не подходит', dot: 'bg-[#9AA39E]', color: 'text-[#6B6F6E]' },
-};
-
-const statusText = (c) =>
-  c.status === 'interview_scheduled' ? `Встреча: ${c.interviewTime}` : STATUS[c.status].label;
-
-const SHORT_STAGE_NAMES = {
+const SHORT_STAGE = {
   'Отобрано по резюме': 'Отобрано',
   'На оценке': 'Оценка',
   'На согласовании у клиента': 'На согласовании у вас',
   'Интервью с клиентом': 'Интервью',
-  'Решение по кандидату': 'Решение по кандидату',
-  'Оффер': 'Оффер',
+  'Решение по кандидату': 'Решение',
+  Оффер: 'Оффер',
   'Вышел на работу': 'Вышли на работу',
 };
 
-const initials = (name) =>
-  name
-    .split(' ')
-    .map((w) => w[0])
-    .slice(0, 2)
-    .join('');
+const isReject = (s) => /^отказ/i.test(String(s || ''));
+
+function stageTone(status) {
+  const s = String(status || '').toLowerCase();
+  if (isReject(s)) return 'bg-[#F3E6E6] text-[#9B2C2C]';
+  if (/оффер|вышел/.test(s)) return 'bg-[#E3F1E4] text-[#035A07]';
+  if (/соглас|интервью|решени/.test(s)) return 'bg-[#E1F2F0] text-[#0E8C7F]';
+  if (/оценк|скрининг/.test(s)) return 'bg-[#FBF0DC] text-[#8A5A14]';
+  return 'bg-[#F0F1F1] text-[#444]';
+}
+
+const ERR_TEXT = {
+  forbidden: 'Ссылка недействительна. Обратитесь к вашему менеджеру.',
+  network: 'Нет связи с сервером. Проверьте интернет или адрес веб-приложения.',
+  server: 'Ошибка на сервере. Попробуйте позже.',
+  busy: 'Сервер занят, повторите через минуту.',
+  rate: 'Слишком часто. Подождите пару секунд.',
+  limit: 'Достигнут лимит сообщений в час.',
+  empty: 'Введите текст сообщения.',
+  state: 'Статус встречи уже изменился.',
+  not_found: 'Встреча не найдена.',
+  when_required: 'Укажите, когда вам удобно.',
+};
+const errText = (c) => ERR_TEXT[c] || 'Не удалось выполнить запрос.';
 
 export default function App() {
-  // Режим отображения: 'portal' (весь кабинет) или 'analytics' (автономная страница аналитики)
-  const [viewMode, setViewMode] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('mode') === 'analytics' ? 'analytics' : 'portal';
-  });
+  const params = useMemo(() => new URLSearchParams(window.location.search), []);
+  const token = (params.get('token') || DEFAULT_TOKEN).trim();
+  const companyTitle = params.get('company') || DEFAULT_COMPANY;
 
-  // Выбранный клиентский профиль (Пенотерм из вашего скриншота или Дом Дерева)
-  const [clientKey, setClientKey] = useState('penoterm');
+  const [portal, setPortal] = useState(null); // { vacancies, meetings }
+  const [analytics, setAnalytics] = useState(null);
+  const [portalErr, setPortalErr] = useState('');
+  const [analyticsErr, setAnalyticsErr] = useState('');
+  const [loading, setLoading] = useState(false);
   const [selectedVacancy, setSelectedVacancy] = useState('__all__');
+  const [tab, setTab] = useState('active');
 
-  // Состояние кандидатов и чата
-  const [candidates, setCandidates] = useState(INITIAL_CANDIDATES);
-  const [tab, setTab] = useState('all');
-  const [expandedId, setExpandedId] = useState(null);
-  const [messages, setMessages] = useState([
-    {
-      id: 101,
-      from: 'recruiter',
-      author: 'Надежда · Solid HR',
-      time: '10:40',
-      text: 'Добрый день! Добавила новых кандидатов на согласование и обновила сводку по причинам отказов за неделю.',
-    },
-  ]);
+  // Чат
+  const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState('');
-  const [sentNote, setSentNote] = useState(false);
+  const [chatNote, setChatNote] = useState('');
+  const lastTs = useRef(0);
+  const seen = useRef({});
+  const chatBox = useRef(null);
 
-  // Живое подключение к Google Apps Script (опционально)
-  const [showApiConfig, setShowApiConfig] = useState(false);
-  const [scriptUrl, setScriptUrl] = useState('');
-  const [clientToken, setClientToken] = useState('');
-  const [remoteAnalytics, setRemoteAnalytics] = useState(null);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  const [apiNotice, setApiNotice] = useState('');
-  const [showCodeTip, setShowCodeTip] = useState(false);
+  // Встречи
+  const [proposeId, setProposeId] = useState(null);
+  const [propWhen, setPropWhen] = useState('');
+  const [propComment, setPropComment] = useState('');
+  const [busyMeeting, setBusyMeeting] = useState('');
 
-  // Подгружаем шрифт Jost
   useEffect(() => {
     const id = 'solid-hr-jost-font';
     if (!document.getElementById(id)) {
       const link = document.createElement('link');
       link.id = id;
       link.rel = 'stylesheet';
-      link.href =
-        'https://fonts.googleapis.com/css2?family=Jost:wght@300;400;500;600&display=swap';
+      link.href = 'https://fonts.googleapis.com/css2?family=Jost:wght@300;400;500;600&display=swap';
       document.head.appendChild(link);
     }
   }, []);
 
-  const activePreset = ANALYTICS_PRESETS[clientKey];
-  const analyticsRoot = remoteAnalytics || activePreset.analytics;
+  // ------------------------------------------------------------- загрузка данных
+  const loadPortal = useCallback(async () => {
+    const r = await jsonp({ token });
+    if (r && r.error) { setPortalErr(r.error); return; }
+    if (r && Array.isArray(r.vacancies)) { setPortal(r); setPortalErr(''); } else setPortalErr('server');
+  }, [token]);
 
-  // Текущий срез аналитики (Все вакансии или конкретная вакансия)
-  const currentStats = useMemo(() => {
-    let base = analyticsRoot.overall;
-    if (selectedVacancy !== '__all__') {
-      const found = (analyticsRoot.vacancies || []).find((v) => v.vacancy === selectedVacancy);
-      if (found) base = found;
-    }
+  const loadAnalytics = useCallback(async () => {
+    const r = await jsonp({ token, action: 'analytics' });
+    if (r && r.ok && r.data) { setAnalytics(r.data); setAnalyticsErr(''); }
+    else setAnalyticsErr((r && r.error) || 'server');
+  }, [token]);
 
-    // Нормализуем и объединяем причины отказов (например, «Недостаточная оплата» + «Зарплатные ожидания»)
-    const mergedReasons = mergeRejectReasons(base.reasons);
-    const sortedReasons = Object.entries(mergedReasons).sort((a, b) => b[1] - a[1]);
-    const totalRejectionsFromReasons = sortedReasons.reduce((acc, [, n]) => acc + n, 0);
+  const refreshAll = useCallback(async () => {
+    setLoading(true);
+    await Promise.all([loadPortal(), loadAnalytics()]);
+    setLoading(false);
+  }, [loadPortal, loadAnalytics]);
 
-    return {
-      ...base,
-      sortedReasons,
-      rejectedTotal: base.rejected || totalRejectionsFromReasons,
+  useEffect(() => { refreshAll(); }, [refreshAll]);
+
+  // ------------------------------------------------------------- чат
+  const mergeMessages = useCallback((list, fromPoll) => {
+    let added = 0;
+    const fresh = [];
+    (list || []).forEach((m) => {
+      if (!m || seen.current[m.id]) return;
+      seen.current[m.id] = true;
+      fresh.push(m);
+      added++;
+    });
+    if (fromPoll) (list || []).forEach((m) => { if (m && m.ts > lastTs.current) lastTs.current = m.ts; });
+    if (added) setMessages((prev) => [...prev, ...fresh].sort((a, b) => a.ts - b.ts));
+  }, []);
+
+  useEffect(() => {
+    let stop = false;
+    let busy = false;
+    const poll = async () => {
+      if (busy || document.hidden || stop) return;
+      busy = true;
+      const r = await jsonp({ token, action: 'chat_get', since: lastTs.current }, 20000);
+      busy = false;
+      if (r && r.ok) mergeMessages(r.messages, true);
     };
-  }, [analyticsRoot, selectedVacancy]);
+    poll();
+    const t = setInterval(poll, POLL_MS);
+    return () => { stop = true; clearInterval(t); };
+  }, [token, mergeMessages]);
 
-  const actionCount = candidates.filter((c) => c.status === 'action_required').length;
-  const filteredCandidates = candidates.filter(
-    (c) => tab === 'all' || c.status === 'action_required'
-  );
+  useEffect(() => {
+    if (chatBox.current) chatBox.current.scrollTop = chatBox.current.scrollHeight;
+  }, [messages]);
 
-  const handleApprove = (id) =>
-    setCandidates((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, status: 'interview_requested' } : c))
-    );
-
-  const handleReject = (id) =>
-    setCandidates((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, status: 'rejected' } : c))
-    );
-
-  const sendMessage = (e) => {
+  const sendMessage = async (e) => {
     e.preventDefault();
     const text = draft.trim();
     if (!text) return;
-    const now = new Date();
-    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(
-      now.getMinutes()
-    ).padStart(2, '0')}`;
-    setMessages((prev) => [...prev, { id: Date.now(), text, from: 'me', time: timeStr }]);
-    setDraft('');
-    setSentNote(true);
-    setTimeout(() => setSentNote(false), 2500);
+    setChatNote('Отправляю…');
+    const r = await jsonp({ token, action: 'chat_send', text }, 20000);
+    if (r && r.ok) {
+      setDraft('');
+      if (r.message) mergeMessages([r.message], false);
+      setChatNote('Сообщение отправлено рекрутёру');
+    } else setChatNote(errText(r && r.error));
+    setTimeout(() => setChatNote(''), 3500);
   };
 
-  // Обновление данных (из Google Apps Script если указан URL/токен, либо мгновенное обновление демо-среза)
-  const handleRefreshAnalytics = async () => {
-    setIsRefreshing(true);
-    setApiNotice('');
-    try {
-      if (scriptUrl.trim() && clientToken.trim()) {
-        const sep = scriptUrl.includes('?') ? '&' : '?';
-        const url = `${scriptUrl.trim()}${sep}client=1&action=analytics&token=${encodeURIComponent(
-          clientToken.trim()
-        )}`;
-        const res = await fetch(url);
-        const json = await res.json();
-        if (json && json.ok && json.data) {
-          setRemoteAnalytics(json.data);
-          setSelectedVacancy('__all__');
-          setApiNotice('Данные успешно загружены из вашей Google Таблицы');
-        } else {
-          setApiNotice('Ответ получен, но токен не найден или доступ закрыт (ошибка forbidden)');
-        }
-      } else {
-        await new Promise((r) => setTimeout(r, 380));
-        setApiNotice('Данные аналитики актуальны');
-      }
-    } catch (err) {
-      setApiNotice('Не удалось подключиться к веб-приложению Apps Script — проверьте URL');
-    } finally {
-      setIsRefreshing(false);
-      setTimeout(() => setApiNotice(''), 4000);
-    }
+  // ------------------------------------------------------------- встречи
+  const replyMeeting = async (id, reply, when = '', comment = '') => {
+    setBusyMeeting(id);
+    const r = await jsonp({ token, action: 'meeting', id, reply, when, comment }, 30000);
+    setBusyMeeting('');
+    if (!(r && r.ok)) alert(errText(r && r.error));
+    setProposeId(null); setPropWhen(''); setPropComment('');
+    loadPortal();
   };
 
-  const scrollTo = (id) => {
-    if (viewMode === 'analytics' && id !== 'analytics') {
-      setViewMode('portal');
-      setTimeout(() => {
-        document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
-      }, 60);
-      return;
-    }
-    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
-  };
+  // ------------------------------------------------------------- производные данные
+  const vacancies = portal?.vacancies || [];
+  const meetings = portal?.meetings || [];
 
-  // Максимальные значения для графиков
-  const maxFunnelCount = Math.max(
-    1,
-    ...(currentStats.funnel || []).map((f) => Number(f.count) || 0)
+  const vacancyNames = useMemo(() => [...new Set(vacancies.map((v) => v.vacancy))], [vacancies]);
+
+  const shownVacancies = useMemo(
+    () => (selectedVacancy === '__all__' ? vacancies : vacancies.filter((v) => v.vacancy === selectedVacancy)),
+    [vacancies, selectedVacancy]
   );
-  const maxWeeklyVal = Math.max(
-    1,
-    ...(currentStats.weekly?.added || [1]),
-    ...(currentStats.weekly?.presented || [1])
-  );
-  const maxReasonVal = Math.max(
-    1,
-    ...(currentStats.sortedReasons || []).map(([, val]) => val)
-  );
+
+  const stats = useMemo(() => {
+    if (!analytics) return null;
+    if (selectedVacancy === '__all__') return analytics.overall;
+    return (analytics.vacancies || []).find((v) => v.vacancy === selectedVacancy) || analytics.overall;
+  }, [analytics, selectedVacancy]);
+
+  const reasons = useMemo(() => (stats ? mergeReasons(stats.reasons) : []), [stats]);
+  const maxFunnel = Math.max(1, ...((stats?.funnel || []).map((f) => f.count)));
+  const maxWeek = Math.max(1, ...(stats?.weekly?.added || [1]), ...(stats?.weekly?.presented || [1]));
+  const maxReason = Math.max(1, ...reasons.map(([, n]) => n));
+
+  const totalCandidates = shownVacancies.reduce((a, v) => a + (v.candidates || []).length, 0);
+  const totalRejects = shownVacancies.reduce((a, v) => a + (v.candidates || []).filter((c) => isReject(c.status)).length, 0);
+  const waitingClient = shownVacancies.reduce(
+    (a, v) => a + (v.candidates || []).filter((c) => /соглас|интервью|решени/i.test(c.status)).length, 0);
+
+  const scrollTo = (id) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
+
+  // ------------------------------------------------------------- состояния ошибок
+  if (portalErr === 'forbidden') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-white font-[Jost,sans-serif] text-center px-6">
+        <div>
+          <AlertTriangle className="w-8 h-8 mx-auto text-[#D9962B]" />
+          <p className="mt-4 text-lg">{errText('forbidden')}</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-white text-[#111111] font-[Jost,sans-serif] selection:bg-[#035A07] selection:text-white">
+    <div className="min-h-screen bg-white text-[#111111] font-[Jost,sans-serif]">
       {/* Шапка */}
       <header className="sticky top-0 z-30 bg-[#F6F7F8]/95 backdrop-blur border-b border-[#E5E7E6]">
         <div className="max-w-5xl mx-auto px-5 sm:px-8 h-16 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-6">
-            <button
-              type="button"
-              onClick={() => setViewMode('portal')}
-              className="flex items-center gap-1.5 text-left"
-            >
-              <span className="text-base font-semibold tracking-tight">Solid</span>
-              <span className="text-base font-semibold tracking-tight text-[#0E8C7F]">HR.</span>
-            </button>
-
-            {/* Переключатель режима: Весь кабинет / Автономная аналитика */}
-            <div className="hidden md:inline-flex items-center bg-white border border-[#E5E7E6] p-0.5 text-xs">
-              <button
-                type="button"
-                onClick={() => setViewMode('portal')}
-                className={`px-3 py-1 transition ${
-                  viewMode === 'portal'
-                    ? 'bg-[#111111] text-white'
-                    : 'text-[#6B6F6E] hover:text-[#111111]'
-                }`}
-              >
-                Весь кабинет
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewMode('analytics')}
-                className={`px-3 py-1 transition ${
-                  viewMode === 'analytics'
-                    ? 'bg-[#035A07] text-white'
-                    : 'text-[#6B6F6E] hover:text-[#111111]'
-                }`}
-              >
-                Только аналитика
-              </button>
-            </div>
+          <div className="text-base font-semibold tracking-tight">
+            Solid <span className="text-[#0E8C7F]">HR.</span>
           </div>
-
           <nav className="hidden sm:flex items-center gap-7 text-sm">
-            {viewMode === 'portal' && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => scrollTo('candidates')}
-                  className="hover:text-[#035A07] transition"
-                >
-                  Кандидаты
-                </button>
-                <button
-                  type="button"
-                  onClick={() => scrollTo('chat')}
-                  className="hover:text-[#035A07] transition"
-                >
-                  Чат с рекрутером
-                </button>
-              </>
-            )}
-            <button
-              type="button"
-              onClick={() => scrollTo('analytics')}
-              className={`transition ${
-                viewMode === 'analytics'
-                  ? 'text-[#035A07] font-medium'
-                  : 'hover:text-[#035A07]'
-              }`}
-            >
-              Аналитика
-            </button>
+            <button type="button" onClick={() => scrollTo('candidates')} className="hover:text-[#035A07]">Кандидаты</button>
+            <button type="button" onClick={() => scrollTo('chat')} className="hover:text-[#035A07]">Чат</button>
+            <button type="button" onClick={() => scrollTo('analytics')} className="hover:text-[#035A07]">Аналитика</button>
           </nav>
-
-          {/* Переключатель демо-клиента (Пенотерм / Дом Дерева) */}
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] uppercase tracking-[0.15em] text-[#6B6F6E] hidden lg:inline">
-              Кабинет:
-            </span>
-            <div className="inline-flex border border-[#E5E7E6] bg-white text-xs">
-              <button
-                type="button"
-                onClick={() => {
-                  setRemoteAnalytics(null);
-                  setClientKey('penoterm');
-                  setSelectedVacancy('__all__');
-                }}
-                className={`px-2.5 py-1 transition ${
-                  clientKey === 'penoterm'
-                    ? 'bg-[#035A07] text-white font-medium'
-                    : 'text-[#6B6F6E] hover:text-[#111111]'
-                }`}
-              >
-                Пенотерм
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setRemoteAnalytics(null);
-                  setClientKey('dom_dereva');
-                  setSelectedVacancy('__all__');
-                }}
-                className={`px-2.5 py-1 transition ${
-                  clientKey === 'dom_dereva'
-                    ? 'bg-[#035A07] text-white font-medium'
-                    : 'text-[#6B6F6E] hover:text-[#111111]'
-                }`}
-              >
-                Дом Дерева
-              </button>
-            </div>
-          </div>
+          <button
+            type="button"
+            onClick={refreshAll}
+            disabled={loading}
+            className="inline-flex items-center gap-2 text-sm px-4 py-2 bg-[#035A07] text-white hover:bg-[#024605] disabled:opacity-60"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+            Обновить
+          </button>
         </div>
       </header>
 
-      {/* Hero-секция (в режиме полного кабинета) */}
-      {viewMode === 'portal' && (
-        <section className="relative bg-[#035A07] text-white overflow-hidden">
-          <div className="max-w-5xl mx-auto px-5 sm:px-8 pt-14 pb-24 relative z-10">
-            <p className="text-[11px] uppercase tracking-[0.2em] opacity-80">
-              Активный подбор · {activePreset.companyTitle}
-            </p>
-            <h1 className="text-3xl sm:text-5xl font-light mt-4 leading-tight max-w-2xl">
-              {selectedVacancy === '__all__' ? activePreset.heroVacancy : selectedVacancy}
-            </h1>
-            <p className="text-sm sm:text-base opacity-80 mt-5">{activePreset.deadlineNote}</p>
-            {actionCount > 0 && (
-              <div className="mt-8 flex flex-wrap items-center gap-4">
-                <p className="text-sm">Ждём вашего решения по кандидатам: {actionCount}</p>
-                <button
-                  type="button"
-                  onClick={() => scrollTo('candidates')}
-                  className="text-sm border border-white px-5 py-2 hover:bg-white hover:text-[#035A07] transition"
-                >
-                  Посмотреть кандидатов
-                </button>
-                <button
-                  type="button"
-                  onClick={() => scrollTo('analytics')}
-                  className="text-sm text-white/85 underline underline-offset-4 hover:text-white transition"
-                >
-                  Открыть полную аналитику
-                </button>
-              </div>
-            )}
-          </div>
+      {/* Hero */}
+      <section className="bg-[#035A07] text-white">
+        <div className="max-w-5xl mx-auto px-5 sm:px-8 py-12">
+          <p className="text-[11px] uppercase tracking-[0.2em] opacity-80">Кабинет заказчика</p>
+          <h1 className="text-3xl sm:text-5xl font-light mt-3">{companyTitle}</h1>
+          <p className="text-sm opacity-80 mt-4">
+            {portal
+              ? `Обновлено: ${vacancies[0]?.updated || '—'}`
+              : portalErr
+              ? errText(portalErr)
+              : 'Загружаем данные из таблицы…'}
+          </p>
 
-          {/* Декоративная геометрия в фирменном стиле */}
-          <div
-            className="absolute top-0 right-0 h-full w-2/5 bg-[#024605] hidden md:block"
-            style={{ clipPath: 'polygon(26% 0, 100% 0, 100% 100%, 0 100%)' }}
-          />
-          <div
-            className="absolute bottom-0 left-0 right-0 h-10 bg-white"
-            style={{ clipPath: 'polygon(0 100%, 100% 0, 100% 100%)' }}
-          />
-        </section>
-      )}
+          <div className="mt-8 grid grid-cols-2 sm:grid-cols-4 gap-6">
+            <div><p className="text-3xl font-light">{totalCandidates}</p><p className="text-xs opacity-80 mt-1">Всего кандидатов</p></div>
+            <div><p className="text-3xl font-light">{totalCandidates - totalRejects}</p><p className="text-xs opacity-80 mt-1">В работе</p></div>
+            <div><p className="text-3xl font-light">{waitingClient}</p><p className="text-xs opacity-80 mt-1">У вас / финал</p></div>
+            <div><p className="text-3xl font-light">{totalRejects}</p><p className="text-xs opacity-80 mt-1">Отказы</p></div>
+          </div>
+        </div>
+      </section>
 
       <main className="max-w-5xl mx-auto px-5 sm:px-8 pb-24">
-        {/* ВЕРХНЯЯ ЧАСТЬ ПОРТАЛА (скрывается в режиме «Только аналитика») */}
-        {viewMode === 'portal' && (
-          <>
-            {/* Компактная горизонтальная воронка */}
-            <section className="pt-10 pb-12 border-b border-[#E5E7E6]">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-8">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                  Воронка подбора ({currentStats.vacancy})
-                </p>
-                <button
-                  type="button"
-                  onClick={() => scrollTo('analytics')}
-                  className="text-xs text-[#0E8C7F] hover:underline inline-flex items-center gap-1"
-                >
-                  Подробная аналитика и причины отказов
-                  <ArrowUpRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
+        {portalErr && portalErr !== 'forbidden' && (
+          <div className="mt-6 p-4 border-l-2 border-[#D9962B] bg-[#F6F7F8] text-sm flex items-center justify-between gap-4">
+            <span>{errText(portalErr)}</span>
+            <button type="button" onClick={refreshAll} className="underline underline-offset-4">Повторить</button>
+          </div>
+        )}
 
-              <div className="relative overflow-x-auto pb-2">
-                <div className="min-w-[540px] relative">
-                  <div className="absolute top-9 left-0 right-0 h-px bg-[#E5E7E6]" />
-                  <div className="relative flex justify-between">
-                    {(currentStats.funnel || []).map((item) => (
-                      <div
-                        key={item.stage}
-                        className="flex flex-col items-center w-0 flex-1 min-w-[72px]"
-                      >
-                        <span className="text-xl sm:text-2xl font-light">{item.count}</span>
-                        <span
-                          className={`w-3 h-3 rounded-full mt-2 mb-3 transition-colors ${
-                            item.count > 0 ? 'bg-[#035A07]' : 'bg-[#E5E7E6]'
-                          }`}
-                        />
-                        <span className="text-[10px] sm:text-xs text-[#6B6F6E] text-center leading-tight px-1">
-                          {SHORT_STAGE_NAMES[item.stage] || item.stage}
-                        </span>
-                      </div>
-                    ))}
+        {/* Фильтр вакансий */}
+        <div className="pt-8 flex flex-wrap items-center justify-between gap-4">
+          <div className="relative">
+            <select
+              value={selectedVacancy}
+              onChange={(e) => setSelectedVacancy(e.target.value)}
+              className="appearance-none bg-[#F6F7F8] border border-[#B8C2BB] text-sm pl-4 pr-9 py-2.5 outline-none cursor-pointer"
+            >
+              <option value="__all__">Все вакансии ({companyTitle})</option>
+              {vacancyNames.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+            <ChevronDown className="w-4 h-4 text-[#6B6F6E] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          </div>
+        </div>
+
+        {/* Собеседования */}
+        {meetings.length > 0 && (
+          <section className="pt-10">
+            <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">Собеседования</p>
+            <ul className="mt-4 divide-y divide-[#E5E7E6] border-y border-[#E5E7E6]">
+              {meetings.map((m) => (
+                <li key={m.id} className="py-4">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <p><b className="font-medium">{m.candidate}</b> <span className="text-[#6B6F6E] text-sm">· {m.vacancy}</span></p>
+                    <span className="text-xs px-2 py-0.5 bg-[#F6F7F8] border border-[#E5E7E6]">{m.status}</span>
                   </div>
-                </div>
-              </div>
-            </section>
-
-            {/* Список кандидатов */}
-            <section id="candidates" className="pt-12">
-              <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#E5E7E6] mb-2">
-                <div className="flex gap-7 text-sm">
-                  {[
-                    ['all', `Все активные финалисты ${candidates.length}`],
-                    ['action', `Ждём решения ${actionCount}`],
-                  ].map(([key, label]) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => setTab(key)}
-                      className={`pb-3 -mb-px border-b-2 transition ${
-                        tab === key
-                          ? 'border-[#111111] text-[#111111]'
-                          : 'border-transparent text-[#6B6F6E] hover:text-[#111111]'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <span className="text-xs text-[#6B6F6E] pb-2">
-                  Персональные данные открыты только для кандидатов на этапе согласования
-                </span>
-              </div>
-
-              {filteredCandidates.length === 0 ? (
-                <p className="py-16 text-center text-[#6B6F6E]">
-                  Сейчас новых решений нет. Мы сообщим, когда появятся кандидаты.
-                </p>
-              ) : (
-                <ul>
-                  {filteredCandidates.map((c) => {
-                    const open = expandedId === c.id;
-                    const st = STATUS[c.status];
-                    const muted = c.status === 'rejected';
-                    return (
-                      <li key={c.id} className="border-b border-[#E5E7E6] py-6">
-                        <div
-                          className={`flex flex-col sm:flex-row sm:items-start gap-4 ${
-                            muted ? 'opacity-50' : ''
-                          }`}
+                  <p className="text-sm mt-1">
+                    {m.date}{m.time ? `, ${m.time}` : ''}{m.weekday ? ` (${m.weekday})` : ''}
+                  </p>
+                  <p className="text-xs text-[#6B6F6E] mt-1">
+                    {[m.format, m.place, m.interviewer ? `Проводит: ${m.interviewer}` : ''].filter(Boolean).join(' · ')}
+                  </p>
+                  {m.proposed && (
+                    <p className="text-xs text-[#0E8C7F] mt-1">Вы предложили: {m.proposed}{m.comment ? ` — ${m.comment}` : ''}</p>
+                  )}
+                  {(m.canConfirm || m.canPropose) && (
+                    <div className="mt-3 flex flex-wrap gap-3">
+                      {m.canConfirm && (
+                        <button
+                          type="button"
+                          disabled={busyMeeting === m.id}
+                          onClick={() => replyMeeting(m.id, 'confirm')}
+                          className="text-sm px-4 py-2 bg-[#035A07] text-white hover:bg-[#024605] disabled:opacity-60"
                         >
-                          <div className="w-12 h-12 shrink-0 rounded-full bg-[#F6F7F8] text-[#035A07] flex items-center justify-center text-sm font-medium">
-                            {initials(c.name)}
-                          </div>
+                          {busyMeeting === m.id ? 'Отправляю…' : 'Подтвердить'}
+                        </button>
+                      )}
+                      {m.canPropose && (
+                        <button
+                          type="button"
+                          onClick={() => setProposeId(proposeId === m.id ? null : m.id)}
+                          className="text-sm px-4 py-2 border border-[#B8C2BB] hover:border-[#111111]"
+                        >
+                          Другое время
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {proposeId === m.id && (
+                    <div className="mt-3 space-y-2 max-w-md">
+                      <input
+                        value={propWhen}
+                        onChange={(e) => setPropWhen(e.target.value)}
+                        maxLength={60}
+                        placeholder="Когда вам удобно? Например: 7 ноября, 16:00"
+                        className="w-full border border-[#B8C2BB] px-3 py-2 text-sm outline-none focus:border-[#111111]"
+                      />
+                      <input
+                        value={propComment}
+                        onChange={(e) => setPropComment(e.target.value)}
+                        maxLength={300}
+                        placeholder="Комментарий (необязательно)"
+                        className="w-full border border-[#B8C2BB] px-3 py-2 text-sm outline-none focus:border-[#111111]"
+                      />
+                      <button
+                        type="button"
+                        disabled={!propWhen.trim() || busyMeeting === m.id}
+                        onClick={() => replyMeeting(m.id, 'propose', propWhen.trim(), propComment.trim())}
+                        className="text-sm px-4 py-2 bg-[#111111] text-white disabled:opacity-50"
+                      >
+                        Отправить
+                      </button>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
-                          <div className="flex-1 min-w-0">
-                            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                              <h2 className="text-xl font-normal">{c.name}</h2>
-                              <span className="text-xs text-[#6B6F6E]">Опыт {c.experience}</span>
-                              <span className="text-xs text-[#6B6F6E]">· {c.vacancy}</span>
-                            </div>
-                            <p className="text-xs text-[#6B6F6E] mt-1">
-                              {c.role} · {c.location} · Ожидания: {c.salary}
-                            </p>
-                            <p className="text-sm mt-3 leading-relaxed text-[#111111]/85">
-                              {c.solidSummary}
-                            </p>
+        {/* Кандидаты */}
+        <section id="candidates" className="pt-14">
+          <div className="flex gap-7 text-sm border-b border-[#E5E7E6] mb-4">
+            {[
+              ['all', 'Все кандидаты'],
+              ['active', 'В работе'],
+              ['reject', 'Отказы'],
+            ].map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setTab(key)}
+                className={`pb-3 -mb-px border-b-2 ${tab === key ? 'border-[#111111]' : 'border-transparent text-[#6B6F6E] hover:text-[#111111]'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
 
-                            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mt-4 text-xs">
-                              <span className={`inline-flex items-center gap-2 ${st.color}`}>
-                                <span className={`w-2 h-2 rounded-full ${st.dot}`} />
-                                {statusText(c)}
-                              </span>
-                              {c.status === 'action_required' && (
-                                <span className="text-[#6B6F6E]">
-                                  Ожидает ответа: {c.daysWaiting} дн.
-                                </span>
-                              )}
-                              <button
-                                type="button"
-                                onClick={() => setExpandedId(open ? null : c.id)}
-                                className="underline underline-offset-4 decoration-[#B8C2BB] hover:decoration-[#111111]"
-                              >
-                                {open ? 'Свернуть' : 'Подробнее и резюме'}
-                              </button>
-                            </div>
+          {!portal && !portalErr && <p className="py-10 text-center text-[#6B6F6E]">Загружаем кандидатов…</p>}
 
-                            {open && (
-                              <div className="mt-6 pt-6 border-t border-[#E5E7E6] space-y-5">
-                                <p className="text-xs uppercase tracking-[0.14em] text-[#6B6F6E]">
-                                  Ключевые навыки: <span className="text-[#111111] normal-case tracking-normal">{c.tags.join('  /  ')}</span>
-                                </p>
-                                <div className="flex flex-wrap items-center gap-4">
-                                  <a
-                                    href={c.cvUrl}
-                                    onClick={(e) => e.preventDefault()}
-                                    className="text-sm underline underline-offset-4 decoration-[#B8C2BB] hover:decoration-[#111111]"
-                                  >
-                                    Открыть полное резюме (PDF)
-                                  </a>
-                                  {c.status === 'action_required' && (
-                                    <>
-                                      <button
-                                        type="button"
-                                        onClick={() => handleReject(c.id)}
-                                        className="text-sm px-5 py-2.5 border border-[#B8C2BB] hover:border-[#111111] transition"
-                                      >
-                                        Не подходит
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() => handleApprove(c.id)}
-                                        className="text-sm px-5 py-2.5 bg-[#035A07] text-white hover:bg-[#024605] transition"
-                                      >
-                                        Позвать на интервью
-                                      </button>
-                                    </>
-                                  )}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </section>
+          {shownVacancies.map((v, i) => {
+            const list = (v.candidates || []).filter((c) =>
+              tab === 'all' ? true : tab === 'reject' ? isReject(c.status) : !isReject(c.status));
+            return (
+              <details key={`${v.company}-${v.vacancy}-${i}`} open={i === 0} className="border border-[#E5E7E6] mb-4">
+                <summary className="cursor-pointer select-none px-4 py-3 bg-[#F6F7F8] flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium">{v.vacancy}</span>
+                  <span className="text-xs text-[#6B6F6E]">Показано: {list.length} из {(v.candidates || []).length}</span>
+                </summary>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-[11px] uppercase tracking-wider text-[#6B6F6E] border-b border-[#E5E7E6]">
+                        <th className="px-4 py-2 font-normal">Кандидат</th>
+                        <th className="px-4 py-2 font-normal">Этап</th>
+                        <th className="px-4 py-2 font-normal">Дата этапа</th>
+                        <th className="px-4 py-2 font-normal">SLA</th>
+                        <th className="px-4 py-2 font-normal">Комментарий рекрутёра</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {list.length === 0 ? (
+                        <tr><td colSpan={5} className="px-4 py-6 text-center text-[#6B6F6E]">Нет кандидатов в выбранном фильтре</td></tr>
+                      ) : list.map((c, k) => (
+                        <tr key={k} className="border-b border-[#EEF0EF]">
+                          <td className="px-4 py-3 font-medium">{c.fio}</td>
+                          <td className="px-4 py-3"><span className={`text-xs px-2 py-1 ${stageTone(c.status)}`}>{c.status}</span></td>
+                          <td className="px-4 py-3 text-[#6B6F6E] whitespace-nowrap">{c.date}</td>
+                          <td className="px-4 py-3 whitespace-nowrap">{c.sla || '—'}</td>
+                          <td className="px-4 py-3 text-[#444] max-w-sm">{c.note || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            );
+          })}
+        </section>
 
-            {/* Чат с рекрутером */}
-            <section id="chat" className="pt-20 pb-12 border-b border-[#E5E7E6]">
-              <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                Чат с рекрутером
+        {/* Чат */}
+        <section id="chat" className="pt-16">
+          <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">Чат с рекрутёром</p>
+          <div ref={chatBox} className="mt-4 max-h-80 overflow-y-auto space-y-3 border border-[#E5E7E6] p-4">
+            {messages.length === 0 && <p className="text-sm text-[#6B6F6E] text-center py-6">Сообщений пока нет.</p>}
+            {messages.map((m) => (
+              <div key={m.id} className={`flex ${m.from === 'client' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[80%] px-4 py-2.5 text-sm ${m.from === 'client' ? 'bg-[#035A07] text-white' : 'bg-[#F6F7F8] border border-[#E5E7E6]'}`}>
+                  <p className={`text-[11px] mb-0.5 ${m.from === 'client' ? 'text-white/70' : 'text-[#0E8C7F]'}`}>{m.name}{m.when ? ` · ${m.when}` : ''}</p>
+                  <p className="whitespace-pre-wrap break-words">{m.text}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          <form onSubmit={sendMessage} className="mt-4 flex gap-3">
+            <input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              maxLength={500}
+              placeholder="Напишите сообщение рекрутёру…"
+              className="flex-1 border-b border-[#B8C2BB] focus:border-[#111111] outline-none py-2 text-sm"
+            />
+            <button type="submit" className="inline-flex items-center gap-2 text-sm px-5 py-2 border border-[#111111] hover:bg-[#111111] hover:text-white">
+              <Send className="w-3.5 h-3.5" /> Отправить
+            </button>
+          </form>
+          {chatNote && <p className="text-xs text-[#0E8C7F] mt-2">{chatNote}</p>}
+        </section>
+
+        {/* Аналитика */}
+        <section id="analytics" className="pt-16">
+          <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">Аналитика подбора</p>
+
+          {analyticsErr && (
+            <div className="mt-4 p-4 border-l-2 border-[#D9962B] bg-[#F6F7F8] text-sm flex items-center justify-between gap-4">
+              <span>Аналитику не удалось загрузить: {errText(analyticsErr)}</span>
+              <button type="button" onClick={loadAnalytics} className="underline underline-offset-4">Повторить</button>
+            </div>
+          )}
+          {!stats && !analyticsErr && <p className="py-10 text-[#6B6F6E]">Считаем данные…</p>}
+
+          {stats && (
+            <>
+              <h2 className="text-2xl sm:text-3xl font-light mt-2">{stats.vacancy}</h2>
+              <p className="text-xs text-[#6B6F6E] mt-1">
+                {stats.since ? `В работе с ${stats.since} (${stats.daysOpen} дн.) · ` : ''}Обновлено: {analytics.generated}
               </p>
-              <h2 className="text-2xl font-light mt-3">Напишите Надежде</h2>
 
-              <div className="mt-8 space-y-3 min-h-[80px]">
-                {messages.map((m) => (
-                  <div
-                    key={m.id}
-                    className={`flex ${m.from === 'me' ? 'justify-end' : 'justify-start'}`}
-                  >
-                    <div
-                      className={`max-w-[82%] px-4 py-3 text-sm ${
-                        m.from === 'me'
-                          ? 'bg-[#035A07] text-white'
-                          : 'bg-[#F6F7F8] text-[#111111] border border-[#E5E7E6]'
-                      }`}
-                    >
-                      {m.author && (
-                        <p className="text-[11px] text-[#0E8C7F] font-medium mb-1">{m.author}</p>
-                      )}
-                      <p className="leading-relaxed">{m.text}</p>
-                      {m.time && (
-                        <p
-                          className={`text-[10px] mt-1.5 ${
-                            m.from === 'me' ? 'text-white/70 text-right' : 'text-[#6B6F6E]'
-                          }`}
-                        >
-                          {m.time}
-                        </p>
-                      )}
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-6 py-8 border-b border-[#E5E7E6]">
+                {[
+                  [stats.total, 'Кандидатов всего'],
+                  [stats.active, 'Активно в работе'],
+                  [stats.presented, 'Представлено вам'],
+                  [`${stats.offers} / ${stats.hired}`, 'Офферы / вышли'],
+                  [stats.rejected, 'Отказов'],
+                ].map(([val, label]) => (
+                  <div key={label}>
+                    <p className="text-3xl font-light">{val}</p>
+                    <p className="text-xs text-[#6B6F6E] mt-1">{label}</p>
+                  </div>
+                ))}
+              </div>
+
+              {/* Воронка */}
+              <div className="py-10 border-b border-[#E5E7E6] space-y-3">
+                <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E] mb-4">Воронка и конверсия</p>
+                {(stats.funnel || []).map((row, idx) => (
+                  <div key={row.stage} className="grid grid-cols-12 items-center gap-3 text-sm">
+                    <div className="col-span-5 sm:col-span-3 truncate">{SHORT_STAGE[row.stage] || row.stage}</div>
+                    <div className="col-span-4 sm:col-span-6">
+                      <div className="h-2.5 bg-[#F6F7F8]">
+                        <div className={idx >= 5 ? 'h-full bg-[#035A07]' : 'h-full bg-[#0E8C7F]'}
+                          style={{ width: `${row.count > 0 ? Math.max(2, Math.round((row.count / maxFunnel) * 100)) : 0}%` }} />
+                      </div>
+                    </div>
+                    <div className="col-span-3 flex justify-end items-baseline gap-2">
+                      <span className="tabular-nums">{row.count}</span>
+                      <span className="text-[11px] text-[#6B6F6E] hidden sm:inline w-24">
+                        {row.conv === null || row.conv === undefined ? '' : `${row.conv}% от пред.`}
+                      </span>
                     </div>
                   </div>
                 ))}
               </div>
 
-              <form onSubmit={sendMessage} className="mt-6 flex gap-4 items-end">
-                <input
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  placeholder="Ваше сообщение по кандидатам или профилю вакансии..."
-                  className="flex-1 bg-transparent border-b border-[#B8C2BB] focus:border-[#111111] outline-none py-2 text-sm"
-                />
-                <button
-                  type="submit"
-                  className="text-sm px-5 py-2.5 border border-[#111111] hover:bg-[#111111] hover:text-white transition"
-                >
-                  Отправить
-                </button>
-              </form>
-              {sentNote && (
-                <p className="text-xs text-[#0E8C7F] mt-3">
-                  Сообщение отправлено в Telegram рекрутеру
-                </p>
-              )}
-            </section>
-          </>
-        )}
-
-        {/* ==========================================================================
-            ПОЛНАЯ АВТОНОМНАЯ СЕКЦИЯ АНАЛИТИКИ (по схеме Analytics.gs)
-           ========================================================================== */}
-        <section id="analytics" className={viewMode === 'analytics' ? 'pt-10' : 'pt-20'}>
-          {/* Шапка аналитики с фильтром вакансий и кнопкой обновления */}
-          <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 pb-8 border-b border-[#E5E7E6]">
-            <div>
-              <div className="flex items-center gap-3">
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                  Аналитика подбора · {activePreset.companyTitle}
-                </p>
-                {viewMode === 'analytics' && (
-                  <span className="text-[10px] uppercase tracking-[0.15em] px-2 py-0.5 bg-[#F6F7F8] border border-[#E5E7E6] text-[#035A07]">
-                    Автономный режим
-                  </span>
-                )}
-              </div>
-              <h2 className="text-2xl sm:text-4xl font-light mt-2 leading-tight">
-                {currentStats.vacancy}
-              </h2>
-              <p className="text-xs text-[#6B6F6E] mt-2">
-                {currentStats.since
-                  ? `В работе с ${currentStats.since} (${currentStats.daysOpen} дн.)`
-                  : 'Сводные показатели по открытым позициям'}{' '}
-                · Обновлено: {analyticsRoot.generated}
-              </p>
-            </div>
-
-            {/* Панель управления: выбор вакансии + Обновить + Настройка Apps Script */}
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="relative">
-                <select
-                  value={selectedVacancy}
-                  onChange={(e) => setSelectedVacancy(e.target.value)}
-                  className="appearance-none bg-[#F6F7F8] border border-[#B8C2BB] hover:border-[#111111] focus:border-[#111111] text-sm pl-4 pr-9 py-2.5 outline-none transition cursor-pointer"
-                >
-                  <option value="__all__">
-                    Все вакансии компании ({activePreset.companyTitle})
-                  </option>
-                  {(analyticsRoot.vacancies || []).map((v) => (
-                    <option key={v.vacancy} value={v.vacancy}>
-                      {v.vacancy}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown className="w-4 h-4 text-[#6B6F6E] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              </div>
-
-              <button
-                type="button"
-                onClick={handleRefreshAnalytics}
-                disabled={isRefreshing}
-                className="inline-flex items-center gap-2 text-sm px-4 py-2.5 bg-[#035A07] text-white hover:bg-[#024605] transition disabled:opacity-60"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-                Обновить
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setShowApiConfig((v) => !v)}
-                title="Подключить URL вашего Google Apps Script"
-                className={`p-2.5 border transition ${
-                  showApiConfig
-                    ? 'border-[#111111] bg-[#111111] text-white'
-                    : 'border-[#B8C2BB] text-[#6B6F6E] hover:text-[#111111] hover:border-[#111111]'
-                }`}
-              >
-                <Link2 className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-
-          {apiNotice && (
-            <div className="mt-4 px-4 py-2.5 bg-[#F6F7F8] border-l-2 border-[#0E8C7F] text-xs text-[#111111]">
-              {apiNotice}
-            </div>
-          )}
-
-          {/* Скрытая панель подключения к реальному Google Apps Script */}
-          {showApiConfig && (
-            <div className="mt-6 p-5 bg-[#F6F7F8] border border-[#E5E7E6] space-y-4">
-              <div className="flex items-center justify-between">
-                <p className="text-xs font-medium uppercase tracking-[0.15em] text-[#111111]">
-                  Прямое подключение к вашему Google Apps Script (?client=1&action=analytics)
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setShowApiConfig(false)}
-                  className="text-xs text-[#6B6F6E] hover:text-[#111111]"
-                >
-                  Закрыть
-                </button>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[11px] text-[#6B6F6E] mb-1">
-                    URL веб-приложения (https://script.google.com/macros/s/.../exec)
-                  </label>
-                  <input
-                    value={scriptUrl}
-                    onChange={(e) => setScriptUrl(e.target.value)}
-                    placeholder="https://script.google.com/macros/s/.../exec"
-                    className="w-full bg-white border border-[#B8C2BB] px-3 py-2 text-xs outline-none focus:border-[#111111]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] text-[#6B6F6E] mb-1">
-                    Токен клиента из листа «_Клиенты» (от 24 символов)
-                  </label>
-                  <input
-                    value={clientToken}
-                    onChange={(e) => setClientToken(e.target.value)}
-                    placeholder="Вставьте токен компании..."
-                    className="w-full bg-white border border-[#B8C2BB] px-3 py-2 text-xs outline-none focus:border-[#111111]"
-                  />
-                </div>
-              </div>
-              <p className="text-[11px] text-[#6B6F6E]">
-                Если поля пустые, страница работает на встроенных данных вашего скриншота («Пенотерм» и «Дом Дерева»).
-              </p>
-            </div>
-          )}
-
-          {/* 1. КЛЮЧЕВЫЕ МЕТРИКИ (KPI STRIP) */}
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-6 sm:gap-8 py-10 border-b border-[#E5E7E6]">
-            <div>
-              <p className="text-3xl sm:text-4xl font-light">{currentStats.total}</p>
-              <p className="text-xs text-[#6B6F6E] mt-2">Отобрано по резюме</p>
-            </div>
-            <div>
-              <p className="text-3xl sm:text-4xl font-light text-[#0E8C7F]">
-                {currentStats.active}
-              </p>
-              <p className="text-xs text-[#6B6F6E] mt-2">Активно в работе</p>
-            </div>
-            <div>
-              <p className="text-3xl sm:text-4xl font-light">{currentStats.presented}</p>
-              <p className="text-xs text-[#6B6F6E] mt-2">Представлено вам</p>
-            </div>
-            <div>
-              <p className="text-3xl sm:text-4xl font-light text-[#035A07]">
-                {currentStats.offers}{' '}
-                <span className="text-lg text-[#6B6F6E] font-light">/ {currentStats.hired}</span>
-              </p>
-              <p className="text-xs text-[#6B6F6E] mt-2">Офферы / Вышли</p>
-            </div>
-            <div>
-              <p className="text-3xl sm:text-4xl font-light text-[#6B6F6E]">
-                {currentStats.rejectedTotal}
-              </p>
-              <p className="text-xs text-[#6B6F6E] mt-2">Всего отказов</p>
-            </div>
-          </div>
-
-          {/* 2. ПОДРОБНАЯ ВОРОНКА С КОНВЕРСИЕЙ ЭТАПОВ */}
-          <div className="py-12 border-b border-[#E5E7E6]">
-            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-8">
-              <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                Воронка и конверсия этапов
-              </p>
-              <span className="text-xs text-[#6B6F6E]">
-                Накопительный учёт прохождения кандидатов по этапам
-              </span>
-            </div>
-
-            <div className="space-y-4">
-              {(currentStats.funnel || []).map((row, idx) => {
-                const pctWidth =
-                  row.count > 0 ? Math.max(2, Math.round((row.count / maxFunnelCount) * 100)) : 0;
-                const label = SHORT_STAGE_NAMES[row.stage] || row.stage;
-                return (
-                  <div
-                    key={row.stage}
-                    className="grid grid-cols-12 items-center gap-3 sm:gap-5 text-sm"
-                  >
-                    <div className="col-span-5 sm:col-span-3 text-xs sm:text-sm text-[#111111] truncate">
-                      {label}
-                    </div>
-
-                    <div className="col-span-4 sm:col-span-6">
-                      <div className="h-2.5 w-full bg-[#F6F7F8] overflow-hidden">
-                        <div
-                          className={`h-full transition-all duration-500 ${
-                            idx === 0
-                              ? 'bg-[#0E8C7F]'
-                              : idx >= 5
-                              ? 'bg-[#035A07]'
-                              : 'bg-[#035A07]/80'
-                          }`}
-                          style={{ width: `${pctWidth}%` }}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="col-span-3 sm:col-span-3 flex items-baseline justify-end gap-2.5 text-right">
-                      <span className="text-base sm:text-lg font-normal tabular-nums">
-                        {row.count}
-                      </span>
-                      <span className="text-[11px] text-[#6B6F6E] w-28 hidden sm:inline-block text-left">
-                        {idx === 0
-                          ? '100% базы'
-                          : row.conv !== null && row.conv !== undefined
-                          ? `${row.conv}% от пред.`
-                          : '—'}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* 3. СРОКИ И ДИНАМИКА ПО НЕДЕЛЯМ (2 колонки) */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 py-12 border-b border-[#E5E7E6]">
-            {/* Блок «Сроки» */}
-            <div className="lg:col-span-5 flex flex-col justify-between space-y-6">
-              <div>
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                  Сроки и скорость
-                </p>
-                <h3 className="text-xl font-light mt-2">Скорость прохождения этапов</h3>
-
-                <div className="mt-6 space-y-5">
-                  <div className="p-4 bg-[#F6F7F8] border-l-2 border-[#D9962B]">
-                    <p className="text-xs text-[#6B6F6E]">Ожидают вашего решения сейчас</p>
-                    <p className="text-xl font-normal mt-1">
-                      {currentStats.waitingNow?.count > 0 ? (
-                        <>
-                          {currentStats.waitingNow.count} канд.{' '}
-                          <span className="text-sm font-light text-[#6B6F6E]">
-                            (в среднем {currentStats.waitingNow.avgDays} дн.)
-                          </span>
-                        </>
-                      ) : (
-                        <span className="text-sm font-normal text-[#035A07]">
-                          Нет зависших согласований
-                        </span>
-                      )}
-                    </p>
-                  </div>
-
-                  <div className="border-t border-[#E5E7E6] pt-4">
-                    <p className="text-xs text-[#6B6F6E]">Среднее время ответа по кандидату</p>
-                    <p className="text-xl font-light mt-1">
-                      {currentStats.waitDone?.count > 0
-                        ? `${currentStats.waitDone.avg} дн. (на базе ${currentStats.waitDone.count} реш.)`
-                        : 'Накапливаем данные'}
-                    </p>
-                  </div>
-
-                  <div className="border-t border-[#E5E7E6] pt-4">
-                    <p className="text-xs text-[#6B6F6E]">Медианное время до оффера</p>
-                    <p className="text-sm text-[#111111] mt-1">
-                      {currentStats.offerDays?.count >= 3 ? (
-                        <span className="text-xl font-light">
-                          {currentStats.offerDays.median} дн.
-                        </span>
-                      ) : (
-                        <span className="text-xs text-[#6B6F6E]">
-                          Накапливаем данные (нужно не меньше 3 случаев, пока{' '}
-                          {currentStats.offerDays?.count || 0})
-                        </span>
-                      )}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Блок «Динамика по неделям» */}
-            <div className="lg:col-span-7">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                    Динамика по неделям
+              {/* Сроки и недели */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-10 py-10 border-b border-[#E5E7E6]">
+                <div className="lg:col-span-5 space-y-4 text-sm">
+                  <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">Сроки</p>
+                  <p>
+                    {stats.waitingNow?.count > 0
+                      ? `Ожидают вашего решения: ${stats.waitingNow.count} (в среднем ${stats.waitingNow.avgDays} дн.)`
+                      : 'Нет кандидатов, ожидающих вашего решения.'}
                   </p>
-                  <h3 className="text-xl font-light mt-2">Активность за 8 недель</h3>
+                  {stats.waitDone?.count >= 3 && <p>Среднее время вашего решения: {stats.waitDone.avg} дн. (случаев: {stats.waitDone.count})</p>}
+                  <p className="text-[#6B6F6E]">
+                    {stats.offerDays?.count >= 3
+                      ? `До оффера: ${stats.offerDays.median} дн. (медиана, случаев: ${stats.offerDays.count})`
+                      : `Время до оффера: накапливаем данные (нужно не меньше 3 случаев, пока ${stats.offerDays?.count || 0}).`}
+                  </p>
                 </div>
-
-                {/* Легенда */}
-                <div className="flex items-center gap-5 text-xs text-[#6B6F6E]">
-                  <span className="inline-flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 bg-[#0E8C7F] inline-block" />
-                    новые кандидаты
-                  </span>
-                  <span className="inline-flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 bg-[#035A07] inline-block" />
-                    представлено вам
-                  </span>
+                <div className="lg:col-span-7">
+                  <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">Динамика по неделям</p>
+                  <div className="mt-4 h-44 flex items-end justify-between gap-2 px-2 bg-[#F6F7F8]/60 border border-[#E5E7E6] pt-4">
+                    {(stats.weekly?.labels || []).map((label, i) => {
+                      const a = stats.weekly.added[i] || 0;
+                      const p = stats.weekly.presented[i] || 0;
+                      return (
+                        <div key={label} className="flex-1 flex flex-col items-center">
+                          <div className="flex items-end gap-1 h-32">
+                            <div className="w-3 sm:w-4 bg-[#0E8C7F]" title={`Новые: ${a}`} style={{ height: `${a > 0 ? Math.max(6, (a / maxWeek) * 120) : 2}px` }} />
+                            <div className="w-3 sm:w-4 bg-[#035A07]" title={`Представлено: ${p}`} style={{ height: `${p > 0 ? Math.max(6, (p / maxWeek) * 120) : 2}px` }} />
+                          </div>
+                          <span className="text-[10px] text-[#6B6F6E] mt-2">{label}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs text-[#6B6F6E] mt-2">
+                    <span className="inline-block w-2.5 h-2.5 bg-[#0E8C7F] mr-1" />новые кандидаты &nbsp;
+                    <span className="inline-block w-2.5 h-2.5 bg-[#035A07] mr-1" />представлено вам
+                  </p>
                 </div>
               </div>
 
-              {/* Вертикальный столбчатый график за 8 недель */}
-              <div className="mt-8 pt-6 pb-2 px-4 bg-[#F6F7F8]/60 border border-[#E5E7E6]">
-                <div className="h-44 flex items-end justify-between gap-2 sm:gap-4">
-                  {(currentStats.weekly?.labels || []).map((label, i) => {
-                    const addedVal = currentStats.weekly?.added?.[i] || 0;
-                    const presVal = currentStats.weekly?.presented?.[i] || 0;
-                    const addedHeight =
-                      addedVal > 0 ? Math.max(6, Math.round((addedVal / maxWeeklyVal) * 130)) : 2;
-                    const presHeight =
-                      presVal > 0 ? Math.max(6, Math.round((presVal / maxWeeklyVal) * 130)) : 2;
-
-                    return (
-                      <div key={label} className="flex-1 flex flex-col items-center">
-                        <div className="w-full flex items-end justify-center gap-1 h-36">
-                          {/* Столбец: Новые кандидаты */}
-                          <div className="flex flex-col items-center">
-                            {addedVal > 0 && (
-                              <span className="text-[10px] text-[#6B6F6E] mb-1 tabular-nums">
-                                {addedVal}
-                              </span>
-                            )}
-                            <div
-                              className={`w-3 sm:w-4 transition-all duration-500 ${
-                                addedVal > 0 ? 'bg-[#0E8C7F]' : 'bg-[#E5E7E6]'
-                              }`}
-                              style={{ height: `${addedHeight}px` }}
-                              title={`Новые кандидаты (${label}): ${addedVal}`}
-                            />
-                          </div>
-
-                          {/* Столбец: Представлено клиенту */}
-                          <div className="flex flex-col items-center">
-                            {presVal > 0 && (
-                              <span className="text-[10px] text-[#035A07] font-medium mb-1 tabular-nums">
-                                {presVal}
-                              </span>
-                            )}
-                            <div
-                              className={`w-3 sm:w-4 transition-all duration-500 ${
-                                presVal > 0 ? 'bg-[#035A07]' : 'bg-[#E5E7E6]'
-                              }`}
-                              style={{ height: `${presHeight}px` }}
-                              title={`Представлено вам (${label}): ${presVal}`}
-                            />
+              {/* Причины отказов */}
+              {reasons.length > 0 && (
+                <div className="py-10">
+                  <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E] mb-4">
+                    Причины отказов (всего: {stats.rejected})
+                  </p>
+                  <div className="space-y-3">
+                    {reasons.map(([name, n]) => (
+                      <div key={name} className="grid grid-cols-12 items-center gap-3 text-sm">
+                        <div className="col-span-5 sm:col-span-3 truncate">{name}</div>
+                        <div className="col-span-5 sm:col-span-7">
+                          <div className="h-2.5 bg-[#F6F7F8]">
+                            <div className="h-full bg-[#111111]/80" style={{ width: `${Math.max(2, Math.round((n / maxReason) * 100))}%` }} />
                           </div>
                         </div>
-
-                        <span className="text-[10px] sm:text-xs text-[#6B6F6E] mt-3 tabular-nums">
-                          {label}
-                        </span>
+                        <div className="col-span-2 text-right tabular-nums">{n}</div>
                       </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* 4. ПРИЧИНЫ ОТКАЗОВ (С АВТОМАТИЧЕСКИМ ОБЪЕДИНЕНИЕМ ЗАРПЛАТНЫХ ПРИЧИН) */}
-          <div className="py-12">
-            <div className="flex flex-wrap items-center justify-between gap-4 mb-8">
-              <div>
-                <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">
-                  Структура отказов
-                </p>
-                <h3 className="text-xl font-light mt-2">
-                  Причины отказов (всего отказов: {currentStats.rejectedTotal})
-                </h3>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setShowCodeTip((v) => !v)}
-                className="text-xs text-[#0E8C7F] hover:underline inline-flex items-center gap-1.5"
-              >
-                <Info className="w-3.5 h-3.5" />
-                {showCodeTip
-                  ? 'Скрыть подсказку для Apps Script'
-                  : 'Где объединить «Недостаточная оплата» и «Зарплатные ожидания» в Apps Script?'}
-              </button>
-            </div>
-
-            {/* Подсказка, где поправить группировку в самом Google Apps Script */}
-            {showCodeTip && (
-              <div className="mb-8 p-5 bg-[#F6F7F8] border border-[#E5E7E6] text-xs space-y-3">
-                <p className="font-medium text-[#111111]">
-                  На этой странице причины «Недостаточная оплата» и «Зарплатные ожидания» уже автоматически объединены в одну строку (72 + 15 = 87).
-                </p>
-                <p className="text-[#6B6F6E] leading-relaxed">
-                  Если вы также хотите объединить их на стороне сервера Google Apps Script, откройте файл{' '}
-                  <code className="px-1.5 py-0.5 bg-white border border-[#E5E7E6] text-[#111111]">
-                    Client_api.gs
-                  </code>{' '}
-                  (функцию, где собирается объект <code className="px-1 bg-white">rejectReasons</code>), и добавьте замену перед подсчётом:
-                </p>
-                <pre className="p-3 bg-white border border-[#E5E7E6] overflow-x-auto text-[11px] text-[#111111]">
-{`if (/оплат|зарплат|зп|ожидан|деньг/i.test(reason)) {
-  reason = "Зарплатные ожидания";
-}`}
-                </pre>
-              </div>
-            )}
-
-            <div className="space-y-4">
-              {currentStats.sortedReasons.map(([reasonName, count]) => {
-                const barPct = Math.max(2, Math.round((count / maxReasonVal) * 100));
-                const sharePct =
-                  currentStats.rejectedTotal > 0
-                    ? Math.round((count / currentStats.rejectedTotal) * 100)
-                    : 0;
-
-                return (
-                  <div
-                    key={reasonName}
-                    className="grid grid-cols-12 items-center gap-3 sm:gap-5 text-sm"
-                  >
-                    <div className="col-span-5 sm:col-span-3 text-xs sm:text-sm text-[#111111] truncate">
-                      {reasonName}
-                    </div>
-
-                    <div className="col-span-5 sm:col-span-7">
-                      <div className="h-2.5 w-full bg-[#F6F7F8] overflow-hidden">
-                        <div
-                          className="h-full bg-[#111111]/80 transition-all duration-500"
-                          style={{ width: `${barPct}%` }}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="col-span-2 sm:col-span-2 flex items-baseline justify-end gap-2 text-right">
-                      <span className="text-base font-normal tabular-nums">{count}</span>
-                      <span className="text-[11px] text-[#6B6F6E] w-10 hidden sm:inline-block">
-                        {sharePct}%
-                      </span>
-                    </div>
+                    ))}
                   </div>
-                );
-              })}
-            </div>
+                </div>
+              )}
 
-            {/* Примечание о журнале этапов */}
-            <p className="text-xs text-[#6B6F6E] mt-10 pt-6 border-t border-[#E5E7E6] leading-relaxed">
-              Журнал этапов ведётся с {analyticsRoot.journalSince || '26.10.2026'}: конверсия и сроки
-              уточняются по мере накопления данных, отказавшие до этой даты учитываются на первом
-              этапе. Персональные данные кандидатов на этапе первичного отбора скрыты. Обновлено:{' '}
-              {analyticsRoot.generated}.
-            </p>
-          </div>
+              <p className="text-xs text-[#6B6F6E] pt-6 border-t border-[#E5E7E6] leading-relaxed">
+                {analytics.journalSince ? `Журнал этапов ведётся с ${analytics.journalSince}: конверсия и сроки уточняются по мере накопления данных. ` : ''}
+                Персональные данные кандидатов скрыты.
+              </p>
+            </>
+          )}
         </section>
       </main>
 
-      <footer className="border-t border-[#E5E7E6] py-8 px-5 text-center text-xs text-[#6B6F6E]">
-        Solid HR · Кабинет клиента и аналитика подбора
+      <footer className="border-t border-[#E5E7E6] py-8 text-center text-xs text-[#6B6F6E]">
+        Solid HR · Кабинет клиента
       </footer>
     </div>
   );
