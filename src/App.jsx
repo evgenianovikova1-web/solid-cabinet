@@ -4,9 +4,7 @@ import { RefreshCw, ChevronDown, Send, AlertTriangle } from 'lucide-react';
 // ============================================================================
 // НАСТРОЙКИ ПОДКЛЮЧЕНИЯ К GOOGLE ТАБЛИЦЕ (через Apps Script)
 // ============================================================================
-const SCRIPT_URL =
-  'https://https://script.google.com/macros/s/https://script.google.com/macros/s/AKfycbz-tFsTrpz3iqxIESVW1LsHhv51aoVDqHdOdM1aGcvZiYfFXqWPuIiLWmrATGF325h-9Q/exec';
-
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz-tFsTrpz3iqxIESVW1LsHhv51aoVDqHdOdM1aGcvZiYfFXqWPuIiLWmrATGF325h-9Q/exec';
 // Код клиента берётся из адреса страницы: ?token=КОД. Если его нет — используется код по умолчанию.
 // Коды лежат в листе «_Клиенты», колонка C.
 
