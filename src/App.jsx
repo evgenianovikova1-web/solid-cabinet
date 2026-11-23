@@ -240,9 +240,12 @@ export default function App() {
 
   const totalCandidates = shownVacancies.reduce((a, v) => a + (v.candidates || []).length, 0);
   const totalRejects = shownVacancies.reduce((a, v) => a + (v.candidates || []).filter((c) => isReject(c.status)).length, 0);
+     const isFinal = (s) => /^(оффер|вышел)/i.test(String(s || ''));
+  const finalCount = shownVacancies.reduce(
+    (a, v) => a + (v.candidates || []).filter((c) => isFinal(c.status)).length, 0);
   const waitingClient = shownVacancies.reduce(
     (a, v) => a + (v.candidates || []).filter((c) => /соглас|интервью|решени/i.test(c.status)).length, 0);
-
+  const inWork = totalCandidates - totalRejects - finalCount;
   const scrollTo = (id) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
 
   // ------------------------------------------------------------- состояния ошибок
@@ -297,8 +300,8 @@ export default function App() {
 
           <div className="mt-8 grid grid-cols-2 sm:grid-cols-4 gap-6">
             <div><p className="text-3xl font-light">{totalCandidates}</p><p className="text-xs opacity-80 mt-1">Всего кандидатов</p></div>
-            <div><p className="text-3xl font-light">{totalCandidates - totalRejects}</p><p className="text-xs opacity-80 mt-1">В работе</p></div>
-            <div><p className="text-3xl font-light">{waitingClient}</p><p className="text-xs opacity-80 mt-1">У вас / финал</p></div>
+            <div><p className="text-3xl font-light">{inWork}</p><p className="text-xs opacity-80 mt-1">В работе</p></div>
+            <div><p className="text-3xl font-light">{waitingClient + finalCount}</p><p className="text-xs opacity-80 mt-1">У вас / финал</p></div>
             <div><p className="text-3xl font-light">{totalRejects}</p><p className="text-xs opacity-80 mt-1">Отказы</p></div>
           </div>
         </div>
