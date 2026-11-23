@@ -230,7 +230,7 @@ export default function App() {
   const stats = useMemo(() => {
     if (!analytics) return null;
     if (selectedVacancy === '__all__') return analytics.overall;
-    return (analytics.vacancies || []).find((v) => v.vacancy === selectedVacancy) || analytics.overall;
+    return (analytics.vacancies || []).find((v) => v.vacancy === selectedVacancy) || null;
   }, [analytics, selectedVacancy]);
 
   const reasons = useMemo(() => (stats ? mergeReasons(stats.reasons) : []), [stats]);
@@ -498,14 +498,25 @@ export default function App() {
         {/* Аналитика */}
         <section id="analytics" className="pt-16">
           <p className="text-[11px] uppercase tracking-[0.2em] text-[#6B6F6E]">Аналитика подбора</p>
-
+<select
+  value={selectedVacancy}
+  onChange={(e) => setSelectedVacancy(e.target.value)}
+  className="mt-3 appearance-none bg-[#F6F7F8] border border-[#B8C2BB] text-sm pl-4 pr-9 py-2 outline-none cursor-pointer"
+>
+  <option value="__all__">Все вакансии</option>
+  {vacancyNames.map((n) => <option key={n} value={n}>{n}</option>)}
+</select>
           {analyticsErr && (
             <div className="mt-4 p-4 border-l-2 border-[#D9962B] bg-[#F6F7F8] text-sm flex items-center justify-between gap-4">
               <span>Аналитику не удалось загрузить: {errText(analyticsErr)}</span>
               <button type="button" onClick={loadAnalytics} className="underline underline-offset-4">Повторить</button>
             </div>
           )}
-          {!stats && !analyticsErr && <p className="py-10 text-[#6B6F6E]">Считаем данные…</p>}
+          {!stats && !analyticsErr && (
+  <p className="py-10 text-[#6B6F6E]">
+    {analytics ? 'По этой вакансии пока нет данных' : 'Считаем данные…'}
+  </p>
+)}
 
           {stats && (
             <>
